@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::engine::Engine;
+use crate::engine::{Engine, SelfTrade, ANONYMOUS};
 use crate::pool::{Level, Pool};
 use crate::types::{L2Snapshot, Level2, OrderId, Price, Qty, Side, SubmitResult, Trade};
 
@@ -31,6 +31,8 @@ pub struct OrderBook {
     pool: Pool,
     /// `OrderId -> arena slot`, for `O(1)` cancellation.
     locations: HashMap<OrderId, u32>,
+    /// Self-trade-prevention policy applied to aggressor orders.
+    stp: SelfTrade,
     /// Source of monotonically-increasing order ids.
     next_id: OrderId,
 }
@@ -42,23 +44,34 @@ impl Default for OrderBook {
 }
 
 impl OrderBook {
-    /// Create an empty book.
+    /// Create an empty book (self-trade prevention off).
     pub fn new() -> Self {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             pool: Pool::new(),
             locations: HashMap::new(),
+            stp: SelfTrade::Allow,
             next_id: 0,
         }
     }
 
-    /// Submit a limit order.
+    /// Set the self-trade-prevention policy for subsequent aggressor orders.
+    pub fn set_self_trade(&mut self, policy: SelfTrade) {
+        self.stp = policy;
+    }
+
+    /// Submit an [`ANONYMOUS`] limit order (no self-trade prevention).
     ///
     /// The order first matches as much as it can against the opposite side
     /// (best price first, FIFO within a price). Any unfilled remainder rests on
     /// its own side of the book at `price`.
     pub fn submit_limit(&mut self, side: Side, price: Price, qty: Qty) -> SubmitResult {
+        self.submit_limit_as(ANONYMOUS, side, price, qty)
+    }
+
+    /// Submit a limit order attributed to `owner`.
+    pub fn submit_limit_as(&mut self, owner: OrderId, side: Side, price: Price, qty: Qty) -> SubmitResult {
         assert!(qty > 0, "cannot submit a zero-quantity order");
 
         let id = self.next_id;
@@ -67,51 +80,59 @@ impl OrderBook {
         let mut trades = Vec::new();
         // A buy matches into the asks taking the lowest price first; a sell
         // matches into the bids taking the highest price first.
-        let remaining = match side {
+        let outcome = match side {
             Side::Bid => match_into(
                 &mut self.asks, &mut self.pool, &mut self.locations,
-                id, qty, &mut trades, Best::Lowest, |ask| ask <= price,
+                id, owner, self.stp, qty, &mut trades, Best::Lowest, |ask| ask <= price,
             ),
             Side::Ask => match_into(
                 &mut self.bids, &mut self.pool, &mut self.locations,
-                id, qty, &mut trades, Best::Highest, |bid| bid >= price,
+                id, owner, self.stp, qty, &mut trades, Best::Highest, |bid| bid >= price,
             ),
         };
 
+        // A remainder only rests if it wasn't cancelled by self-trade prevention.
+        let remaining = if outcome.cancelled { 0 } else { outcome.remaining };
         if remaining > 0 {
             let book = match side {
                 Side::Bid => &mut self.bids,
                 Side::Ask => &mut self.asks,
             };
             let level = book.entry(price).or_insert_with(Level::empty);
-            let slot = self.pool.push_back(level, id, price, side, remaining);
+            let slot = self.pool.push_back(level, id, owner, price, side, remaining);
             self.locations.insert(id, slot);
         }
 
         SubmitResult { id, trades, resting: remaining }
     }
 
-    /// Submit a market order — match against the best prices with no limit.
-    /// Never rests; the unfilled remainder is reported in `resting`.
+    /// Submit an [`ANONYMOUS`] market order.
     pub fn submit_market(&mut self, side: Side, qty: Qty) -> SubmitResult {
+        self.submit_market_as(ANONYMOUS, side, qty)
+    }
+
+    /// Submit a market order attributed to `owner` — match against the best
+    /// prices with no limit. Never rests; the unfilled remainder is reported in
+    /// `resting`.
+    pub fn submit_market_as(&mut self, owner: OrderId, side: Side, qty: Qty) -> SubmitResult {
         assert!(qty > 0, "cannot submit a zero-quantity order");
 
         let id = self.next_id;
         self.next_id += 1;
 
         let mut trades = Vec::new();
-        let remaining = match side {
+        let outcome = match side {
             Side::Bid => match_into(
                 &mut self.asks, &mut self.pool, &mut self.locations,
-                id, qty, &mut trades, Best::Lowest, |_| true,
+                id, owner, self.stp, qty, &mut trades, Best::Lowest, |_| true,
             ),
             Side::Ask => match_into(
                 &mut self.bids, &mut self.pool, &mut self.locations,
-                id, qty, &mut trades, Best::Highest, |_| true,
+                id, owner, self.stp, qty, &mut trades, Best::Highest, |_| true,
             ),
         };
 
-        SubmitResult { id, trades, resting: remaining }
+        SubmitResult { id, trades, resting: outcome.remaining }
     }
 
     /// Change a resting order's quantity (see [`Engine::amend`]).
@@ -136,9 +157,11 @@ impl OrderBook {
             // Shrink in place — time priority preserved.
             self.pool.reduce(level, slot, current - new_qty);
         } else {
-            // Grow — priority is forfeited: move to the back of the level.
+            // Grow — priority is forfeited: move to the back of the level,
+            // keeping the same id and owner.
+            let owner = self.pool.owner_of(slot);
             self.pool.unlink(level, slot);
-            let new_slot = self.pool.push_back(level, id, price, side, new_qty);
+            let new_slot = self.pool.push_back(level, id, owner, price, side, new_qty);
             self.locations.insert(id, new_slot);
         }
         true
@@ -210,11 +233,14 @@ impl OrderBook {
 }
 
 impl Engine for OrderBook {
-    fn submit_limit(&mut self, side: Side, price: Price, qty: Qty) -> SubmitResult {
-        OrderBook::submit_limit(self, side, price, qty)
+    fn submit_limit_as(&mut self, owner: OrderId, side: Side, price: Price, qty: Qty) -> SubmitResult {
+        OrderBook::submit_limit_as(self, owner, side, price, qty)
     }
-    fn submit_market(&mut self, side: Side, qty: Qty) -> SubmitResult {
-        OrderBook::submit_market(self, side, qty)
+    fn submit_market_as(&mut self, owner: OrderId, side: Side, qty: Qty) -> SubmitResult {
+        OrderBook::submit_market_as(self, owner, side, qty)
+    }
+    fn set_self_trade(&mut self, policy: SelfTrade) {
+        OrderBook::set_self_trade(self, policy)
     }
     fn cancel(&mut self, id: OrderId) -> bool {
         OrderBook::cancel(self, id)
@@ -248,25 +274,38 @@ enum Best {
     Highest,
 }
 
+/// The result of matching an aggressor against the book.
+struct MatchOutcome {
+    /// Quantity the aggressor couldn't fill.
+    remaining: Qty,
+    /// Whether self-trade prevention cancelled the aggressor's remainder (so it
+    /// must not rest, even if `remaining > 0`).
+    cancelled: bool,
+}
+
 /// Match an incoming order of `qty` against `map`, taking the best-priced level
 /// first, until it is exhausted or no more levels cross.
 ///
 /// `crosses(level_price)` decides whether the aggressor is still willing to
 /// trade at that level's price. Once the best level no longer crosses, no worse
 /// level can either, so we stop. Fully-filled maker orders are unlinked and
-/// dropped from `locations`. Returns the unfilled remainder.
+/// dropped from `locations`. When the aggressor would match an order it owns,
+/// `stp` decides what happens instead of trading (see [`SelfTrade`]).
 #[allow(clippy::too_many_arguments)]
 fn match_into(
     map: &mut BTreeMap<Price, Level>,
     pool: &mut Pool,
     locations: &mut HashMap<OrderId, u32>,
     taker: OrderId,
+    taker_owner: OrderId,
+    stp: SelfTrade,
     mut qty: Qty,
     trades: &mut Vec<Trade>,
     best: Best,
     crosses: impl Fn(Price) -> bool,
-) -> Qty {
-    while qty > 0 {
+) -> MatchOutcome {
+    let mut cancelled = false;
+    'outer: while qty > 0 {
         // Peek the best price without holding a borrow across the mutation.
         let peek = match best {
             Best::Lowest => map.keys().next(),
@@ -280,9 +319,29 @@ fn match_into(
         while qty > 0 {
             let Some(slot) = pool.head(level) else { break };
             let maker = pool.id_of(slot);
+
+            // Self-trade prevention: the aggressor owns this resting order.
+            if stp != SelfTrade::Allow
+                && taker_owner != ANONYMOUS
+                && pool.owner_of(slot) == taker_owner
+            {
+                let cancel_maker = matches!(stp, SelfTrade::CancelResting | SelfTrade::CancelBoth);
+                if cancel_maker {
+                    pool.unlink(level, slot);
+                    locations.remove(&maker);
+                }
+                if matches!(stp, SelfTrade::CancelAggressor | SelfTrade::CancelBoth) {
+                    cancelled = true;
+                    if pool.is_empty(level) {
+                        map.remove(&best_price);
+                    }
+                    break 'outer;
+                }
+                continue; // CancelResting: skip this maker, keep matching
+            }
+
             let available = pool.qty_of(slot);
             let fill = qty.min(available);
-
             trades.push(Trade { taker, maker, price: best_price, qty: fill });
             qty -= fill;
 
@@ -298,5 +357,5 @@ fn match_into(
             map.remove(&best_price);
         }
     }
-    qty
+    MatchOutcome { remaining: qty, cancelled }
 }

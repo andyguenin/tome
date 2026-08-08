@@ -4,14 +4,15 @@
 //! [`LadderBook`](tome::LadderBook) through the *same* pseudo-random stream of
 //! operations and assert they agree at every step — identical trades, identical
 //! return values, identical book state. Because the two engines share no code
-//! above [`tome::pool`], any divergence is a real bug in one of them.
+//! above [`tome::pool`], any divergence is a real bug.
 //!
-//! Order ids stay in lockstep for free: both engines start at 0 and bump the
-//! same counter on every submit (limit *and* market), so a cancel/amend target
-//! computed once is valid for both.
+//! The stream includes owned orders and an active self-trade-prevention policy,
+//! so the STP paths are cross-checked too. Order ids stay in lockstep for free:
+//! both engines start at 0 and bump the same counter on every submit, so a
+//! cancel/amend target computed once is valid for both.
 
 use tome::sim::Rng;
-use tome::{Engine, LadderBook, OrderBook, Side};
+use tome::{Engine, LadderBook, OrderBook, SelfTrade, Side};
 
 const MIN: u64 = 1_000;
 const MAX: u64 = 1_199; // 200 ticks — wide enough to exercise the bitmap summary
@@ -31,24 +32,27 @@ fn qty(rng: &mut Rng) -> u64 {
     1 + rng.below(MAX_QTY)
 }
 
-/// Apply one random op to both engines and assert they still agree.
-fn step(rng: &mut Rng, a: &mut dyn Engine, b: &mut dyn Engine, next_id: &mut u64) {
+/// Apply one random op to both engines and assert they still agree. `owners`,
+/// when non-zero, draws an owner id from `0..owners` so self-trade prevention
+/// can fire; zero means every order is anonymous.
+fn step(rng: &mut Rng, a: &mut dyn Engine, b: &mut dyn Engine, next_id: &mut u64, owners: u64) {
+    let owner = if owners > 0 { rng.below(owners) } else { u64::MAX };
     match rng.below(100) {
         // ~55%: limit order
         0..=54 => {
             let (s, p, q) = (side(rng), price(rng), qty(rng));
-            let ra = a.submit_limit(s, p, q);
-            let rb = b.submit_limit(s, p, q);
-            assert_eq!(ra, rb, "limit {s:?} {q}@{p} diverged");
+            let ra = a.submit_limit_as(owner, s, p, q);
+            let rb = b.submit_limit_as(owner, s, p, q);
+            assert_eq!(ra, rb, "limit {s:?} {q}@{p} owner {owner} diverged");
             assert_eq!(ra.id, *next_id, "id counters drifted");
             *next_id += 1;
         }
         // ~20%: market order
         55..=74 => {
             let (s, q) = (side(rng), qty(rng));
-            let ra = a.submit_market(s, q);
-            let rb = b.submit_market(s, q);
-            assert_eq!(ra, rb, "market {s:?} {q} diverged");
+            let ra = a.submit_market_as(owner, s, q);
+            let rb = b.submit_market_as(owner, s, q);
+            assert_eq!(ra, rb, "market {s:?} {q} owner {owner} diverged");
             *next_id += 1;
         }
         // ~13%: cancel a (possibly stale) id
@@ -64,7 +68,7 @@ fn step(rng: &mut Rng, a: &mut dyn Engine, b: &mut dyn Engine, next_id: &mut u64
         // Nothing submitted yet: seed the book with a limit order.
         _ => {
             let (s, p, q) = (side(rng), price(rng), qty(rng));
-            assert_eq!(a.submit_limit(s, p, q), b.submit_limit(s, p, q));
+            assert_eq!(a.submit_limit_as(owner, s, p, q), b.submit_limit_as(owner, s, p, q));
             *next_id += 1;
         }
     }
@@ -76,33 +80,40 @@ fn step(rng: &mut Rng, a: &mut dyn Engine, b: &mut dyn Engine, next_id: &mut u64
     assert_eq!(a.l2(SNAPSHOT_DEPTH), b.l2(SNAPSHOT_DEPTH), "book state diverged");
 }
 
-/// Run one seed for `ops` operations.
-fn run(seed: u64, ops: usize) {
+/// Run one seed for `ops` operations under the given owner count and policy.
+fn run(seed: u64, ops: usize, owners: u64, policy: SelfTrade) {
     let mut rng = Rng::new(seed);
     let mut btree = OrderBook::new();
     let mut ladder = LadderBook::new(MIN, MAX);
+    btree.set_self_trade(policy);
+    ladder.set_self_trade(policy);
     let mut next_id = 0;
 
     for _ in 0..ops {
-        step(&mut rng, &mut btree, &mut ladder, &mut next_id);
+        step(&mut rng, &mut btree, &mut ladder, &mut next_id, owners);
     }
-
-    // The run should have actually done something interesting.
     assert!(next_id > 0);
 }
 
 #[test]
 fn engines_agree_across_random_flows() {
-    // A spread of seeds, each a long op stream. Deterministic, so any failure
-    // reproduces exactly.
+    // Anonymous flow, no self-trade prevention.
     for seed in [1u64, 7, 42, 1_000, 0xDEAD_BEEF, 0xC10B_C10B] {
-        run(seed, 20_000);
+        run(seed, 20_000, 0, SelfTrade::Allow);
     }
 }
 
 #[test]
 fn engines_agree_on_amend_heavy_flow() {
-    // Amends and cancels churn resting orders and exercise priority handling;
-    // a dedicated long run over a single seed hammers that path.
-    run(0xA5A5_A5A5, 50_000);
+    run(0xA5A5_A5A5, 50_000, 0, SelfTrade::Allow);
+}
+
+#[test]
+fn engines_agree_with_self_trade_prevention() {
+    // A handful of owners so self-matches are frequent; every STP policy.
+    for policy in [SelfTrade::CancelResting, SelfTrade::CancelAggressor, SelfTrade::CancelBoth] {
+        for seed in [2u64, 13, 0xBEEF, 0x5EED_1234] {
+            run(seed, 20_000, 4, policy);
+        }
+    }
 }

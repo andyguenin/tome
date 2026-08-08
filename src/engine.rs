@@ -12,15 +12,47 @@
 
 use crate::types::{L2Snapshot, OrderId, Price, Qty, Side, SubmitResult};
 
+/// Owner value for orders that opt out of self-trade prevention. Distinct from
+/// every real participant id, so an anonymous order never "self-matches".
+pub const ANONYMOUS: OrderId = OrderId::MAX;
+
+/// What to do when an aggressor would match against a resting order it owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelfTrade {
+    /// No prevention: a participant may trade with itself (default).
+    #[default]
+    Allow,
+    /// Cancel the resting (maker) order and keep matching the aggressor.
+    CancelResting,
+    /// Cancel the aggressor's remaining quantity; leave the maker resting.
+    CancelAggressor,
+    /// Cancel both the resting order and the aggressor's remainder.
+    CancelBoth,
+}
+
 /// A price-time-priority matching engine.
 pub trait Engine {
     /// Submit a limit order; matches then rests any remainder at `price`.
-    fn submit_limit(&mut self, side: Side, price: Price, qty: Qty) -> SubmitResult;
+    /// The order is [`ANONYMOUS`], so self-trade prevention never applies.
+    fn submit_limit(&mut self, side: Side, price: Price, qty: Qty) -> SubmitResult {
+        self.submit_limit_as(ANONYMOUS, side, price, qty)
+    }
 
-    /// Submit a market order: match against the best available prices with no
-    /// price limit. Never rests — any unfilled remainder is cancelled and
-    /// reported in [`SubmitResult::resting`].
-    fn submit_market(&mut self, side: Side, qty: Qty) -> SubmitResult;
+    /// Submit a limit order attributed to `owner` (for self-trade prevention).
+    fn submit_limit_as(&mut self, owner: OrderId, side: Side, price: Price, qty: Qty) -> SubmitResult;
+
+    /// Submit an [`ANONYMOUS`] market order.
+    fn submit_market(&mut self, side: Side, qty: Qty) -> SubmitResult {
+        self.submit_market_as(ANONYMOUS, side, qty)
+    }
+
+    /// Submit a market order attributed to `owner`: match against the best
+    /// available prices with no price limit. Never rests — any unfilled
+    /// remainder is cancelled and reported in [`SubmitResult::resting`].
+    fn submit_market_as(&mut self, owner: OrderId, side: Side, qty: Qty) -> SubmitResult;
+
+    /// Set the self-trade-prevention policy for subsequent aggressor orders.
+    fn set_self_trade(&mut self, policy: SelfTrade);
 
     /// Cancel a resting order. Returns whether it was on the book.
     fn cancel(&mut self, id: OrderId) -> bool;

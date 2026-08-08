@@ -26,6 +26,8 @@ struct Node {
     /// The order's price and side — enough to locate its level on cancel.
     price: Price,
     side: Side,
+    /// The participant that owns this order, for self-trade prevention.
+    owner: OrderId,
     prev: u32,
     next: u32,
 }
@@ -82,6 +84,11 @@ impl Pool {
         self.nodes[idx as usize].qty
     }
 
+    /// The owning participant of the order in slot `idx`.
+    pub fn owner_of(&self, idx: u32) -> OrderId {
+        self.nodes[idx as usize].owner
+    }
+
     /// Where the order in slot `idx` rests: its price and side.
     pub fn location(&self, idx: u32) -> (Price, Side) {
         let n = &self.nodes[idx as usize];
@@ -99,15 +106,17 @@ impl Pool {
     }
 
     /// Append a new resting order at the tail of `level`. Returns its slot.
+    #[allow(clippy::too_many_arguments)]
     pub fn push_back(
         &mut self,
         level: &mut Level,
         id: OrderId,
+        owner: OrderId,
         price: Price,
         side: Side,
         qty: Qty,
     ) -> u32 {
-        let idx = self.alloc(Node { id, qty, price, side, prev: level.tail, next: NONE });
+        let idx = self.alloc(Node { id, qty, price, side, owner, prev: level.tail, next: NONE });
         if level.tail != NONE {
             self.nodes[level.tail as usize].next = idx;
         } else {

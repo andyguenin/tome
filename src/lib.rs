@@ -13,7 +13,7 @@ pub mod sim;
 pub mod types;
 
 pub use book::OrderBook;
-pub use engine::Engine;
+pub use engine::{Engine, SelfTrade, ANONYMOUS};
 pub use journal::{Event, Outcome};
 pub use ladder::LadderBook;
 pub use types::{L2Snapshot, Level2, OrderId, Price, Qty, Side, SubmitResult, Trade};
@@ -257,6 +257,78 @@ mod tests {
                 Level2 { price: 102, qty: 1 },
             ]
         );
+    }
+
+    /// `CancelResting`: the aggressor cancels its own resting order but still
+    /// trades against a *different* owner sitting behind it.
+    #[test]
+    fn stp_cancel_resting_skips_own_order() {
+        let mut book = OrderBook::new();
+        book.set_self_trade(SelfTrade::CancelResting);
+
+        let mine = book.submit_limit_as(1, Side::Bid, 100, 2).id;
+        let theirs = book.submit_limit_as(2, Side::Bid, 100, 2).id;
+
+        // Owner 1 sells: skips (cancels) its own bid `mine`, trades with `theirs`.
+        let res = book.submit_limit_as(1, Side::Ask, 100, 3);
+        assert_eq!(res.trades, vec![Trade { taker: res.id, maker: theirs, price: 100, qty: 2 }]);
+        assert_eq!(res.resting, 1); // 1 left rests as an ask
+        assert_eq!(book.best_ask(), Some(100));
+        assert!(!book.cancel(mine), "own bid should have been cancelled");
+    }
+
+    /// `CancelAggressor`: the incoming order is cancelled on self-match; the
+    /// resting order is untouched.
+    #[test]
+    fn stp_cancel_aggressor_leaves_maker() {
+        let mut book = OrderBook::new();
+        book.set_self_trade(SelfTrade::CancelAggressor);
+
+        book.submit_limit_as(1, Side::Bid, 100, 5);
+        let res = book.submit_limit_as(1, Side::Ask, 100, 3);
+
+        assert!(res.trades.is_empty());
+        assert_eq!(res.resting, 0); // aggressor cancelled, does not rest
+        assert_eq!(book.depth_at(Side::Bid, 100), 5); // maker intact
+        assert_eq!(book.best_ask(), None);
+    }
+
+    /// `CancelBoth`: self-match removes the resting order and cancels the
+    /// aggressor's remainder.
+    #[test]
+    fn stp_cancel_both() {
+        let mut book = OrderBook::new();
+        book.set_self_trade(SelfTrade::CancelBoth);
+
+        book.submit_limit_as(1, Side::Bid, 100, 5);
+        let res = book.submit_limit_as(1, Side::Ask, 100, 3);
+
+        assert!(res.trades.is_empty());
+        assert_eq!(res.resting, 0);
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_ask(), None);
+    }
+
+    /// Self-trade prevention never fires between *different* owners.
+    #[test]
+    fn stp_allows_cross_owner_trades() {
+        let mut book = OrderBook::new();
+        book.set_self_trade(SelfTrade::CancelBoth);
+
+        let maker = book.submit_limit_as(1, Side::Bid, 100, 3).id;
+        let res = book.submit_limit_as(2, Side::Ask, 100, 3);
+        assert_eq!(res.trades, vec![Trade { taker: res.id, maker, price: 100, qty: 3 }]);
+    }
+
+    /// Anonymous orders opt out of prevention even under an active policy.
+    #[test]
+    fn stp_ignores_anonymous_orders() {
+        let mut book = OrderBook::new();
+        book.set_self_trade(SelfTrade::CancelBoth);
+
+        let maker = book.submit_limit(Side::Bid, 100, 3).id; // ANONYMOUS
+        let res = book.submit_limit(Side::Ask, 100, 3); // ANONYMOUS
+        assert_eq!(res.trades, vec![Trade { taker: res.id, maker, price: 100, qty: 3 }]);
     }
 
     /// Freed arena slots are recycled: churn many orders, then confirm the book

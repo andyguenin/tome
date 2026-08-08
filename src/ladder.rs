@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 
 use crate::bitset::LevelBitset;
-use crate::engine::Engine;
+use crate::engine::{Engine, SelfTrade, ANONYMOUS};
 use crate::pool::{Level, Pool};
 use crate::types::{L2Snapshot, Level2, OrderId, Price, Qty, Side, SubmitResult, Trade};
 
@@ -50,6 +50,8 @@ pub struct LadderBook {
     best_bid: u32,
     /// Index of the lowest populated ask level, or [`NONE`].
     best_ask: u32,
+    /// Self-trade-prevention policy applied to aggressor orders.
+    stp: SelfTrade,
     /// Source of monotonically-increasing order ids.
     next_id: OrderId,
 }
@@ -68,8 +70,14 @@ impl LadderBook {
             locations: HashMap::new(),
             best_bid: NONE,
             best_ask: NONE,
+            stp: SelfTrade::Allow,
             next_id: 0,
         }
+    }
+
+    /// Set the self-trade-prevention policy for subsequent aggressor orders.
+    pub fn set_self_trade(&mut self, policy: SelfTrade) {
+        self.stp = policy;
     }
 
     /// Convert a price to its array index, panicking if out of the ladder's band.
@@ -82,8 +90,13 @@ impl LadderBook {
         (price - self.min_price) as u32
     }
 
-    /// Submit a limit order (see [`crate::book::OrderBook::submit_limit`]).
+    /// Submit an [`ANONYMOUS`] limit order (no self-trade prevention).
     pub fn submit_limit(&mut self, side: Side, price: Price, qty: Qty) -> SubmitResult {
+        self.submit_limit_as(ANONYMOUS, side, price, qty)
+    }
+
+    /// Submit a limit order attributed to `owner`.
+    pub fn submit_limit_as(&mut self, owner: OrderId, side: Side, price: Price, qty: Qty) -> SubmitResult {
         assert!(qty > 0, "cannot submit a zero-quantity order");
         let _ = self.index(price); // bounds-check up front
 
@@ -92,11 +105,13 @@ impl LadderBook {
 
         let mut trades = Vec::new();
         let buy = matches!(side, Side::Bid);
-        let remaining = self.take_liquidity(id, price, qty, buy, &mut trades);
+        let (remaining, cancelled) = self.take_liquidity(id, owner, price, qty, buy, &mut trades);
 
+        // A remainder only rests if it wasn't cancelled by self-trade prevention.
+        let remaining = if cancelled { 0 } else { remaining };
         if remaining > 0 {
             let idx = self.index(price);
-            let slot = self.pool.push_back(&mut self.levels[idx as usize], id, price, side, remaining);
+            let slot = self.pool.push_back(&mut self.levels[idx as usize], id, owner, price, side, remaining);
             self.locations.insert(id, slot);
             self.occupied.set(idx as usize);
             match side {
@@ -110,17 +125,19 @@ impl LadderBook {
     }
 
     /// Match `qty` against the opposite side, walking from the best cursor
-    /// toward `limit`. Returns the unfilled remainder and advances the cursor
-    /// past any levels it empties.
+    /// toward `limit`. Returns the unfilled remainder and whether self-trade
+    /// prevention cancelled the aggressor. Advances the cursor past empty levels.
     fn take_liquidity(
         &mut self,
         taker: OrderId,
+        taker_owner: OrderId,
         limit: Price,
         mut qty: Qty,
         buy: bool,
         trades: &mut Vec<Trade>,
-    ) -> Qty {
-        while qty > 0 {
+    ) -> (Qty, bool) {
+        let mut cancelled = false;
+        'outer: while qty > 0 {
             let i = if buy { self.best_ask } else { self.best_bid };
             if i == NONE {
                 break;
@@ -136,9 +153,25 @@ impl LadderBook {
                 let level = &mut self.levels[i as usize];
                 let Some(slot) = self.pool.head(level) else { break };
                 let maker = self.pool.id_of(slot);
+
+                // Self-trade prevention: the aggressor owns this resting order.
+                if self.stp != SelfTrade::Allow
+                    && taker_owner != ANONYMOUS
+                    && self.pool.owner_of(slot) == taker_owner
+                {
+                    if matches!(self.stp, SelfTrade::CancelResting | SelfTrade::CancelBoth) {
+                        self.pool.unlink(level, slot);
+                        self.locations.remove(&maker);
+                    }
+                    if matches!(self.stp, SelfTrade::CancelAggressor | SelfTrade::CancelBoth) {
+                        cancelled = true;
+                        break 'outer;
+                    }
+                    continue; // CancelResting: skip this maker, keep matching
+                }
+
                 let available = self.pool.qty_of(slot);
                 let fill = qty.min(available);
-
                 trades.push(Trade { taker, maker, price: price_i, qty: fill });
                 qty -= fill;
 
@@ -164,12 +197,33 @@ impl LadderBook {
                 break; // taker exhausted, level still has depth
             }
         }
-        qty
+
+        // A break out of 'outer via STP may leave the just-emptied best level's
+        // cursor/bit stale; reconcile it before returning.
+        if cancelled {
+            let i = if buy { self.best_ask } else { self.best_bid };
+            if i != NONE && self.pool.is_empty(&self.levels[i as usize]) {
+                self.occupied.clear(i as usize);
+                if buy {
+                    self.best_ask = self.next_up(i);
+                } else {
+                    self.best_bid = self.next_down(i);
+                }
+            }
+        }
+
+        (qty, cancelled)
     }
 
-    /// Submit a market order — match against the best prices with no limit.
-    /// Never rests; the unfilled remainder is reported in `resting`.
+    /// Submit an [`ANONYMOUS`] market order.
     pub fn submit_market(&mut self, side: Side, qty: Qty) -> SubmitResult {
+        self.submit_market_as(ANONYMOUS, side, qty)
+    }
+
+    /// Submit a market order attributed to `owner` — match against the best
+    /// prices with no limit. Never rests; the unfilled remainder is reported in
+    /// `resting`.
+    pub fn submit_market_as(&mut self, owner: OrderId, side: Side, qty: Qty) -> SubmitResult {
         assert!(qty > 0, "cannot submit a zero-quantity order");
 
         let id = self.next_id;
@@ -179,7 +233,7 @@ impl LadderBook {
         let buy = matches!(side, Side::Bid);
         // No price limit: a buy accepts any ask, a sell accepts any bid.
         let limit = if buy { Price::MAX } else { Price::MIN };
-        let remaining = self.take_liquidity(id, limit, qty, buy, &mut trades);
+        let (remaining, _cancelled) = self.take_liquidity(id, owner, limit, qty, buy, &mut trades);
 
         SubmitResult { id, trades, resting: remaining }
     }
@@ -202,9 +256,11 @@ impl LadderBook {
             // Shrink in place — time priority preserved.
             self.pool.reduce(&mut self.levels[idx], slot, current - new_qty);
         } else {
-            // Grow — priority is forfeited: move to the back of the level.
+            // Grow — priority is forfeited: move to the back of the level,
+            // keeping the same id and owner.
+            let owner = self.pool.owner_of(slot);
             self.pool.unlink(&mut self.levels[idx], slot);
-            let new_slot = self.pool.push_back(&mut self.levels[idx], id, price, side, new_qty);
+            let new_slot = self.pool.push_back(&mut self.levels[idx], id, owner, price, side, new_qty);
             self.locations.insert(id, new_slot);
             // The level stayed non-empty throughout, so its occupancy bit and
             // the cursors are unchanged.
@@ -307,11 +363,14 @@ impl LadderBook {
 }
 
 impl Engine for LadderBook {
-    fn submit_limit(&mut self, side: Side, price: Price, qty: Qty) -> SubmitResult {
-        LadderBook::submit_limit(self, side, price, qty)
+    fn submit_limit_as(&mut self, owner: OrderId, side: Side, price: Price, qty: Qty) -> SubmitResult {
+        LadderBook::submit_limit_as(self, owner, side, price, qty)
     }
-    fn submit_market(&mut self, side: Side, qty: Qty) -> SubmitResult {
-        LadderBook::submit_market(self, side, qty)
+    fn submit_market_as(&mut self, owner: OrderId, side: Side, qty: Qty) -> SubmitResult {
+        LadderBook::submit_market_as(self, owner, side, qty)
+    }
+    fn set_self_trade(&mut self, policy: SelfTrade) {
+        LadderBook::set_self_trade(self, policy)
     }
     fn cancel(&mut self, id: OrderId) -> bool {
         LadderBook::cancel(self, id)
