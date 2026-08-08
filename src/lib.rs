@@ -4,11 +4,13 @@
 //! from a clean baseline. See [`book::OrderBook`] for the entry point.
 
 pub mod book;
+pub mod ladder;
 mod pool;
 pub mod sim;
 pub mod types;
 
 pub use book::OrderBook;
+pub use ladder::LadderBook;
 pub use types::{OrderId, Price, Qty, Side, SubmitResult, Trade};
 
 #[cfg(test)]
