@@ -1,0 +1,200 @@
+//! A central limit order book with a price-time-priority matching engine.
+//!
+//! # Design
+//!
+//! Each side of the book is a [`BTreeMap`] keyed by [`Price`]. This gives us
+//! ordered iteration for free: the best ask is the *lowest* key, the best bid
+//! is the *highest* key, both reachable in `O(log n)`.
+//!
+//! At every price sits a [`Level`] — a FIFO intrusive linked list of resting
+//! orders living in a shared [`Pool`] arena (see [`crate::pool`]). FIFO is
+//! exactly price-*time* priority. A separate `OrderId -> slot` index lets us
+//! cancel any order in `O(1)`.
+//!
+//! The price container is still a `BTreeMap`; swapping it for a flat array
+//! "price ladder" and benchmarking the difference is the intended next step,
+//! and this public API is meant to survive that change.
+
+use std::collections::{BTreeMap, HashMap};
+
+use crate::pool::{Level, Pool};
+use crate::types::{OrderId, Price, Qty, Side, SubmitResult, Trade};
+
+/// A price-time-priority central limit order book.
+pub struct OrderBook {
+    /// Buy orders, keyed by price. Best bid = highest key.
+    bids: BTreeMap<Price, Level>,
+    /// Sell orders, keyed by price. Best ask = lowest key.
+    asks: BTreeMap<Price, Level>,
+    /// The arena holding every resting order node.
+    pool: Pool,
+    /// `OrderId -> arena slot`, for `O(1)` cancellation.
+    locations: HashMap<OrderId, u32>,
+    /// Source of monotonically-increasing order ids.
+    next_id: OrderId,
+}
+
+impl Default for OrderBook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OrderBook {
+    /// Create an empty book.
+    pub fn new() -> Self {
+        Self {
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+            pool: Pool::new(),
+            locations: HashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    /// Submit a limit order.
+    ///
+    /// The order first matches as much as it can against the opposite side
+    /// (best price first, FIFO within a price). Any unfilled remainder rests on
+    /// its own side of the book at `price`.
+    pub fn submit_limit(&mut self, side: Side, price: Price, qty: Qty) -> SubmitResult {
+        assert!(qty > 0, "cannot submit a zero-quantity order");
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let mut trades = Vec::new();
+        // A buy matches into the asks taking the lowest price first; a sell
+        // matches into the bids taking the highest price first.
+        let remaining = match side {
+            Side::Bid => match_into(
+                &mut self.asks, &mut self.pool, &mut self.locations,
+                id, qty, &mut trades, Best::Lowest, |ask| ask <= price,
+            ),
+            Side::Ask => match_into(
+                &mut self.bids, &mut self.pool, &mut self.locations,
+                id, qty, &mut trades, Best::Highest, |bid| bid >= price,
+            ),
+        };
+
+        if remaining > 0 {
+            let book = match side {
+                Side::Bid => &mut self.bids,
+                Side::Ask => &mut self.asks,
+            };
+            let level = book.entry(price).or_insert_with(Level::empty);
+            let slot = self.pool.push_back(level, id, price, side, remaining);
+            self.locations.insert(id, slot);
+        }
+
+        SubmitResult { id, trades, resting: remaining }
+    }
+
+    /// Cancel a resting order by id.
+    ///
+    /// Returns `true` if the order was resting and is now removed, `false` if
+    /// no such order is on the book (already filled, already cancelled, or an
+    /// id that never rested). `O(1)` plus the `O(log n)` level lookup.
+    pub fn cancel(&mut self, id: OrderId) -> bool {
+        let Some(slot) = self.locations.remove(&id) else {
+            return false;
+        };
+        let (price, side) = self.pool.location(slot);
+        let book = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+        };
+        let level = book.get_mut(&price).expect("resting order must have a level");
+        self.pool.unlink(level, slot);
+        if self.pool.is_empty(level) {
+            book.remove(&price);
+        }
+        true
+    }
+
+    /// The highest resting bid price, if any.
+    pub fn best_bid(&self) -> Option<Price> {
+        self.bids.keys().next_back().copied()
+    }
+
+    /// The lowest resting ask price, if any.
+    pub fn best_ask(&self) -> Option<Price> {
+        self.asks.keys().next().copied()
+    }
+
+    /// The gap between best ask and best bid, if both sides are populated.
+    pub fn spread(&self) -> Option<Price> {
+        Some(self.best_ask()? - self.best_bid()?)
+    }
+
+    /// Total resting quantity at `price` on the given side (0 if none).
+    pub fn depth_at(&self, side: Side, price: Price) -> Qty {
+        let book = match side {
+            Side::Bid => &self.bids,
+            Side::Ask => &self.asks,
+        };
+        book.get(&price).map_or(0, |lvl| lvl.total_qty)
+    }
+}
+
+/// Which end of the price-ordered book is the "best" (most aggressive) level to
+/// fill first for the incoming order.
+enum Best {
+    /// Lowest price first — used when matching a buy into the asks.
+    Lowest,
+    /// Highest price first — used when matching a sell into the bids.
+    Highest,
+}
+
+/// Match an incoming order of `qty` against `map`, taking the best-priced level
+/// first, until it is exhausted or no more levels cross.
+///
+/// `crosses(level_price)` decides whether the aggressor is still willing to
+/// trade at that level's price. Once the best level no longer crosses, no worse
+/// level can either, so we stop. Fully-filled maker orders are unlinked and
+/// dropped from `locations`. Returns the unfilled remainder.
+#[allow(clippy::too_many_arguments)]
+fn match_into(
+    map: &mut BTreeMap<Price, Level>,
+    pool: &mut Pool,
+    locations: &mut HashMap<OrderId, u32>,
+    taker: OrderId,
+    mut qty: Qty,
+    trades: &mut Vec<Trade>,
+    best: Best,
+    crosses: impl Fn(Price) -> bool,
+) -> Qty {
+    while qty > 0 {
+        // Peek the best price without holding a borrow across the mutation.
+        let peek = match best {
+            Best::Lowest => map.keys().next(),
+            Best::Highest => map.keys().next_back(),
+        };
+        let Some(&best_price) = peek.filter(|&&p| crosses(p)) else {
+            break;
+        };
+
+        let level = map.get_mut(&best_price).expect("peeked price must exist");
+        while qty > 0 {
+            let Some(slot) = pool.head(level) else { break };
+            let maker = pool.id_of(slot);
+            let available = pool.qty_of(slot);
+            let fill = qty.min(available);
+
+            trades.push(Trade { taker, maker, price: best_price, qty: fill });
+            qty -= fill;
+
+            if fill == available {
+                // Maker fully consumed: unlink and forget it.
+                pool.unlink(level, slot);
+                locations.remove(&maker);
+            } else {
+                pool.reduce(level, slot, fill);
+            }
+        }
+        if pool.is_empty(level) {
+            map.remove(&best_price);
+        }
+    }
+    qty
+}
