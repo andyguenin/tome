@@ -1,0 +1,470 @@
+//! A flat "price ladder" order book: the same matching engine as
+//! [`crate::book::OrderBook`], but with the per-side `BTreeMap` replaced by a
+//! single contiguous array indexed directly by price tick.
+//!
+//! # Why
+//!
+//! In the `BTreeMap` book, reaching a price level costs `O(log n)` and chases
+//! pointers all over the heap. A real instrument trades in a *bounded* band of
+//! prices, so we can preallocate one [`Level`] slot per tick and index it in
+//! `O(1)` with cache-friendly, sequential memory. Finding the best price is
+//! then just following a cursor.
+//!
+//! Bids and asks share one array. That's sound because resting bids are always
+//! strictly below resting asks (anything crossing would have matched), so a
+//! given tick is only ever one side at a time. Two cursors — [`best_bid`] and
+//! [`best_ask`] — track the extremes; scanning to the next non-empty level when
+//! one empties is the only linear cost, and it walks *dense* memory.
+//!
+//! Everything below the price index (the arena, the intrusive FIFO lists,
+//! `O(1)` cancel) is shared verbatim with the `BTreeMap` engine via
+//! [`crate::pool`] — the whole point of the exercise is that only the price
+//! container differs.
+//!
+//! [`best_bid`]: LadderBook::best_bid
+//! [`best_ask`]: LadderBook::best_ask
+
+use std::collections::HashMap;
+
+use crate::bitset::LevelBitset;
+use crate::engine::{Engine, SelfTrade, ANONYMOUS};
+use crate::pool::{Level, Pool};
+use crate::types::{L2Snapshot, Level2, OrderId, Price, Qty, Side, SubmitResult, Trade};
+
+/// Cursor sentinel meaning "no populated level on this side".
+const NONE: u32 = u32::MAX;
+
+/// A price-time-priority order book backed by a flat array of price levels.
+pub struct LadderBook {
+    /// Lowest price the ladder can represent; `levels[0]` is this tick.
+    min_price: Price,
+    /// One [`Level`] per tick in `[min_price, max_price]`.
+    levels: Box<[Level]>,
+    /// Occupancy bitmap over `levels`, for `O(1)` next-non-empty lookups.
+    occupied: LevelBitset,
+    /// Shared arena of resting-order nodes.
+    pool: Pool,
+    /// `OrderId -> arena slot`, for `O(1)` cancellation.
+    locations: HashMap<OrderId, u32>,
+    /// Index of the highest populated bid level, or [`NONE`].
+    best_bid: u32,
+    /// Index of the lowest populated ask level, or [`NONE`].
+    best_ask: u32,
+    /// Self-trade-prevention policy applied to aggressor orders.
+    stp: SelfTrade,
+    /// Source of monotonically-increasing order ids.
+    next_id: OrderId,
+}
+
+impl LadderBook {
+    /// Create an empty book covering the inclusive tick range
+    /// `[min_price, max_price]`. Orders outside this band will panic.
+    pub fn new(min_price: Price, max_price: Price) -> Self {
+        assert!(max_price >= min_price, "empty price range");
+        let ticks = (max_price - min_price + 1) as usize;
+        Self {
+            min_price,
+            levels: vec![Level::empty(); ticks].into_boxed_slice(),
+            occupied: LevelBitset::new(ticks),
+            pool: Pool::new(),
+            locations: HashMap::new(),
+            best_bid: NONE,
+            best_ask: NONE,
+            stp: SelfTrade::Allow,
+            next_id: 0,
+        }
+    }
+
+    /// Set the self-trade-prevention policy for subsequent aggressor orders.
+    pub fn set_self_trade(&mut self, policy: SelfTrade) {
+        self.stp = policy;
+    }
+
+    /// Convert a price to its array index, panicking if out of the ladder's band.
+    #[inline]
+    fn index(&self, price: Price) -> u32 {
+        assert!(
+            price >= self.min_price && (price - self.min_price) < self.levels.len() as Price,
+            "price {price} outside ladder range",
+        );
+        (price - self.min_price) as u32
+    }
+
+    /// Submit an [`ANONYMOUS`] limit order (no self-trade prevention).
+    pub fn submit_limit(&mut self, side: Side, price: Price, qty: Qty) -> SubmitResult {
+        self.submit_limit_as(ANONYMOUS, side, price, qty)
+    }
+
+    /// Submit a limit order attributed to `owner`.
+    pub fn submit_limit_as(&mut self, owner: OrderId, side: Side, price: Price, qty: Qty) -> SubmitResult {
+        assert!(qty > 0, "cannot submit a zero-quantity order");
+        let _ = self.index(price); // bounds-check up front
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let mut trades = Vec::new();
+        let buy = matches!(side, Side::Bid);
+        let (remaining, cancelled) = self.take_liquidity(id, owner, price, qty, buy, &mut trades);
+
+        // A remainder only rests if it wasn't cancelled by self-trade prevention.
+        let remaining = if cancelled { 0 } else { remaining };
+        if remaining > 0 {
+            let idx = self.index(price);
+            let slot = self.pool.push_back(&mut self.levels[idx as usize], id, owner, price, side, remaining);
+            self.locations.insert(id, slot);
+            self.occupied.set(idx as usize);
+            match side {
+                Side::Bid if self.best_bid == NONE || idx > self.best_bid => self.best_bid = idx,
+                Side::Ask if self.best_ask == NONE || idx < self.best_ask => self.best_ask = idx,
+                _ => {}
+            }
+        }
+
+        SubmitResult { id, trades, resting: remaining }
+    }
+
+    /// Match `qty` against the opposite side, walking from the best cursor
+    /// toward `limit`. Returns the unfilled remainder and whether self-trade
+    /// prevention cancelled the aggressor. Advances the cursor past empty levels.
+    fn take_liquidity(
+        &mut self,
+        taker: OrderId,
+        taker_owner: OrderId,
+        limit: Price,
+        mut qty: Qty,
+        buy: bool,
+        trades: &mut Vec<Trade>,
+    ) -> (Qty, bool) {
+        let mut cancelled = false;
+        'outer: while qty > 0 {
+            let i = if buy { self.best_ask } else { self.best_bid };
+            if i == NONE {
+                break;
+            }
+            let price_i = self.min_price + i as Price;
+            let crosses = if buy { price_i <= limit } else { price_i >= limit };
+            if !crosses {
+                break;
+            }
+
+            // Fill this level FIFO until it's empty or the taker is done.
+            loop {
+                let level = &mut self.levels[i as usize];
+                let Some(slot) = self.pool.head(level) else { break };
+                let maker = self.pool.id_of(slot);
+
+                // Self-trade prevention: the aggressor owns this resting order.
+                if self.stp != SelfTrade::Allow
+                    && taker_owner != ANONYMOUS
+                    && self.pool.owner_of(slot) == taker_owner
+                {
+                    if matches!(self.stp, SelfTrade::CancelResting | SelfTrade::CancelBoth) {
+                        self.pool.unlink(level, slot);
+                        self.locations.remove(&maker);
+                    }
+                    if matches!(self.stp, SelfTrade::CancelAggressor | SelfTrade::CancelBoth) {
+                        cancelled = true;
+                        break 'outer;
+                    }
+                    continue; // CancelResting: skip this maker, keep matching
+                }
+
+                let available = self.pool.qty_of(slot);
+                let fill = qty.min(available);
+                trades.push(Trade { taker, maker, price: price_i, qty: fill });
+                qty -= fill;
+
+                if fill == available {
+                    self.pool.unlink(level, slot);
+                    self.locations.remove(&maker);
+                } else {
+                    self.pool.reduce(level, slot, fill);
+                }
+                if qty == 0 {
+                    break;
+                }
+            }
+
+            if self.pool.is_empty(&self.levels[i as usize]) {
+                self.occupied.clear(i as usize);
+                if buy {
+                    self.best_ask = self.next_up(i);
+                } else {
+                    self.best_bid = self.next_down(i);
+                }
+            } else {
+                break; // taker exhausted, level still has depth
+            }
+        }
+
+        // A break out of 'outer via STP may leave the just-emptied best level's
+        // cursor/bit stale; reconcile it before returning.
+        if cancelled {
+            let i = if buy { self.best_ask } else { self.best_bid };
+            if i != NONE && self.pool.is_empty(&self.levels[i as usize]) {
+                self.occupied.clear(i as usize);
+                if buy {
+                    self.best_ask = self.next_up(i);
+                } else {
+                    self.best_bid = self.next_down(i);
+                }
+            }
+        }
+
+        (qty, cancelled)
+    }
+
+    /// Submit an [`ANONYMOUS`] market order.
+    pub fn submit_market(&mut self, side: Side, qty: Qty) -> SubmitResult {
+        self.submit_market_as(ANONYMOUS, side, qty)
+    }
+
+    /// Submit a market order attributed to `owner` — match against the best
+    /// prices with no limit. Never rests; the unfilled remainder is reported in
+    /// `resting`.
+    pub fn submit_market_as(&mut self, owner: OrderId, side: Side, qty: Qty) -> SubmitResult {
+        assert!(qty > 0, "cannot submit a zero-quantity order");
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let mut trades = Vec::new();
+        let buy = matches!(side, Side::Bid);
+        // No price limit: a buy accepts any ask, a sell accepts any bid.
+        let limit = if buy { Price::MAX } else { Price::MIN };
+        let (remaining, _cancelled) = self.take_liquidity(id, owner, limit, qty, buy, &mut trades);
+
+        SubmitResult { id, trades, resting: remaining }
+    }
+
+    /// Change a resting order's quantity (see [`Engine::amend`]).
+    pub fn amend(&mut self, id: OrderId, new_qty: Qty) -> bool {
+        assert!(new_qty > 0, "amend to zero; use cancel instead");
+
+        let Some(&slot) = self.locations.get(&id) else {
+            return false;
+        };
+        let current = self.pool.qty_of(slot);
+        if new_qty == current {
+            return true;
+        }
+        let (price, side) = self.pool.location(slot);
+        let idx = self.index(price) as usize;
+
+        if new_qty < current {
+            // Shrink in place — time priority preserved.
+            self.pool.reduce(&mut self.levels[idx], slot, current - new_qty);
+        } else {
+            // Grow — priority is forfeited: move to the back of the level,
+            // keeping the same id and owner.
+            let owner = self.pool.owner_of(slot);
+            self.pool.unlink(&mut self.levels[idx], slot);
+            let new_slot = self.pool.push_back(&mut self.levels[idx], id, owner, price, side, new_qty);
+            self.locations.insert(id, new_slot);
+            // The level stayed non-empty throughout, so its occupancy bit and
+            // the cursors are unchanged.
+        }
+        true
+    }
+
+    /// A snapshot of the top `depth` price levels per side, walking outward from
+    /// each cursor via the occupancy bitmap.
+    pub fn l2(&self, depth: usize) -> L2Snapshot {
+        let mut bids = Vec::new();
+        let mut i = self.best_bid;
+        while i != NONE && bids.len() < depth {
+            bids.push(Level2 {
+                price: self.min_price + i as Price,
+                qty: self.levels[i as usize].total_qty,
+            });
+            i = self.next_down(i);
+        }
+
+        let mut asks = Vec::new();
+        let mut j = self.best_ask;
+        while j != NONE && asks.len() < depth {
+            asks.push(Level2 {
+                price: self.min_price + j as Price,
+                qty: self.levels[j as usize].total_qty,
+            });
+            j = self.next_up(j);
+        }
+
+        L2Snapshot { bids, asks }
+    }
+
+    /// Cancel a resting order by id (see [`crate::book::OrderBook::cancel`]).
+    pub fn cancel(&mut self, id: OrderId) -> bool {
+        let Some(slot) = self.locations.remove(&id) else {
+            return false;
+        };
+        let (price, side) = self.pool.location(slot);
+        let idx = self.index(price);
+        self.pool.unlink(&mut self.levels[idx as usize], slot);
+
+        // If the level is now empty, drop its occupancy bit and, if it was the
+        // best on its side, walk the cursor inward to the next occupied level.
+        if self.pool.is_empty(&self.levels[idx as usize]) {
+            self.occupied.clear(idx as usize);
+            match side {
+                Side::Bid if idx == self.best_bid => self.best_bid = self.next_down(idx),
+                Side::Ask if idx == self.best_ask => self.best_ask = self.next_up(idx),
+                _ => {}
+            }
+        }
+        true
+    }
+
+    /// First occupied level strictly above `from`, as a cursor value.
+    #[inline]
+    fn next_up(&self, from: u32) -> u32 {
+        self.occupied
+            .next_set_from(from as usize + 1)
+            .map_or(NONE, |i| i as u32)
+    }
+
+    /// First occupied level strictly below `from`, as a cursor value.
+    #[inline]
+    fn next_down(&self, from: u32) -> u32 {
+        if from == 0 {
+            return NONE;
+        }
+        self.occupied
+            .prev_set_from(from as usize - 1)
+            .map_or(NONE, |i| i as u32)
+    }
+
+    /// The highest resting bid price, if any.
+    pub fn best_bid(&self) -> Option<Price> {
+        (self.best_bid != NONE).then(|| self.min_price + self.best_bid as Price)
+    }
+
+    /// The lowest resting ask price, if any.
+    pub fn best_ask(&self) -> Option<Price> {
+        (self.best_ask != NONE).then(|| self.min_price + self.best_ask as Price)
+    }
+
+    /// The gap between best ask and best bid, if both sides are populated.
+    pub fn spread(&self) -> Option<Price> {
+        Some(self.best_ask()? - self.best_bid()?)
+    }
+
+    /// Total resting quantity at `price` on the given side (0 if none, or if
+    /// the price is outside the ladder's range).
+    pub fn depth_at(&self, _side: Side, price: Price) -> Qty {
+        if price < self.min_price {
+            return 0;
+        }
+        self.levels
+            .get((price - self.min_price) as usize)
+            .map_or(0, |lvl| lvl.total_qty)
+    }
+}
+
+impl Engine for LadderBook {
+    fn submit_limit_as(&mut self, owner: OrderId, side: Side, price: Price, qty: Qty) -> SubmitResult {
+        LadderBook::submit_limit_as(self, owner, side, price, qty)
+    }
+    fn submit_market_as(&mut self, owner: OrderId, side: Side, qty: Qty) -> SubmitResult {
+        LadderBook::submit_market_as(self, owner, side, qty)
+    }
+    fn set_self_trade(&mut self, policy: SelfTrade) {
+        LadderBook::set_self_trade(self, policy)
+    }
+    fn cancel(&mut self, id: OrderId) -> bool {
+        LadderBook::cancel(self, id)
+    }
+    fn amend(&mut self, id: OrderId, new_qty: Qty) -> bool {
+        LadderBook::amend(self, id, new_qty)
+    }
+    fn best_bid(&self) -> Option<Price> {
+        LadderBook::best_bid(self)
+    }
+    fn best_ask(&self) -> Option<Price> {
+        LadderBook::best_ask(self)
+    }
+    fn spread(&self) -> Option<Price> {
+        LadderBook::spread(self)
+    }
+    fn depth_at(&self, side: Side, price: Price) -> Qty {
+        LadderBook::depth_at(self, side, price)
+    }
+    fn l2(&self, depth: usize) -> L2Snapshot {
+        LadderBook::l2(self, depth)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn book() -> LadderBook {
+        LadderBook::new(90, 110)
+    }
+
+    #[test]
+    fn walks_levels_cheapest_first_then_rests() {
+        let mut b = book();
+        let a1 = b.submit_limit(Side::Ask, 100, 2).id;
+        let a2 = b.submit_limit(Side::Ask, 101, 2).id;
+
+        let res = b.submit_limit(Side::Bid, 101, 5);
+        assert_eq!(
+            res.trades,
+            vec![
+                Trade { taker: res.id, maker: a1, price: 100, qty: 2 },
+                Trade { taker: res.id, maker: a2, price: 101, qty: 2 },
+            ]
+        );
+        assert_eq!(res.resting, 1);
+        assert_eq!(b.best_bid(), Some(101));
+        assert_eq!(b.best_ask(), None);
+    }
+
+    #[test]
+    fn sell_hits_highest_bid_first() {
+        let mut b = book();
+        let low = b.submit_limit(Side::Bid, 99, 2).id;
+        let high = b.submit_limit(Side::Bid, 100, 2).id;
+
+        let res = b.submit_limit(Side::Ask, 99, 3);
+        assert_eq!(
+            res.trades,
+            vec![
+                Trade { taker: res.id, maker: high, price: 100, qty: 2 },
+                Trade { taker: res.id, maker: low, price: 99, qty: 1 },
+            ]
+        );
+        assert_eq!(b.depth_at(Side::Bid, 99), 1);
+    }
+
+    #[test]
+    fn cancel_advances_cursor() {
+        let mut b = book();
+        let top = b.submit_limit(Side::Bid, 100, 1).id;
+        b.submit_limit(Side::Bid, 99, 1);
+        assert_eq!(b.best_bid(), Some(100));
+
+        assert!(b.cancel(top));
+        assert_eq!(b.best_bid(), Some(99)); // cursor stepped down
+    }
+
+    #[test]
+    fn cancel_middle_preserves_fifo() {
+        let mut b = book();
+        let a = b.submit_limit(Side::Bid, 100, 1).id;
+        let mid = b.submit_limit(Side::Bid, 100, 1).id;
+        let c = b.submit_limit(Side::Bid, 100, 1).id;
+        assert!(b.cancel(mid));
+
+        let res = b.submit_limit(Side::Ask, 100, 2);
+        assert_eq!(
+            res.trades,
+            vec![
+                Trade { taker: res.id, maker: a, price: 100, qty: 1 },
+                Trade { taker: res.id, maker: c, price: 100, qty: 1 },
+            ]
+        );
+    }
+}
