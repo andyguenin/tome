@@ -3,6 +3,7 @@
 //! The goal is a fast, correct price-time-priority matching engine, built up
 //! from a clean baseline. See [`book::OrderBook`] for the entry point.
 
+mod bitset;
 pub mod book;
 pub mod ladder;
 mod pool;

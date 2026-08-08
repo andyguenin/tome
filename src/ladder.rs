@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 
+use crate::bitset::LevelBitset;
 use crate::pool::{Level, Pool};
 use crate::types::{OrderId, Price, Qty, Side, SubmitResult, Trade};
 
@@ -38,6 +39,8 @@ pub struct LadderBook {
     min_price: Price,
     /// One [`Level`] per tick in `[min_price, max_price]`.
     levels: Box<[Level]>,
+    /// Occupancy bitmap over `levels`, for `O(1)` next-non-empty lookups.
+    occupied: LevelBitset,
     /// Shared arena of resting-order nodes.
     pool: Pool,
     /// `OrderId -> arena slot`, for `O(1)` cancellation.
@@ -59,6 +62,7 @@ impl LadderBook {
         Self {
             min_price,
             levels: vec![Level::empty(); ticks].into_boxed_slice(),
+            occupied: LevelBitset::new(ticks),
             pool: Pool::new(),
             locations: HashMap::new(),
             best_bid: NONE,
@@ -93,6 +97,7 @@ impl LadderBook {
             let idx = self.index(price);
             let slot = self.pool.push_back(&mut self.levels[idx as usize], id, price, side, remaining);
             self.locations.insert(id, slot);
+            self.occupied.set(idx as usize);
             match side {
                 Side::Bid if self.best_bid == NONE || idx > self.best_bid => self.best_bid = idx,
                 Side::Ask if self.best_ask == NONE || idx < self.best_ask => self.best_ask = idx,
@@ -148,15 +153,11 @@ impl LadderBook {
             }
 
             if self.pool.is_empty(&self.levels[i as usize]) {
-                let next = if buy {
-                    next_up(&self.levels, &self.pool, i)
-                } else {
-                    next_down(&self.levels, &self.pool, i)
-                };
+                self.occupied.clear(i as usize);
                 if buy {
-                    self.best_ask = next;
+                    self.best_ask = self.next_up(i);
                 } else {
-                    self.best_bid = next;
+                    self.best_bid = self.next_down(i);
                 }
             } else {
                 break; // taker exhausted, level still has depth
@@ -174,19 +175,36 @@ impl LadderBook {
         let idx = self.index(price);
         self.pool.unlink(&mut self.levels[idx as usize], slot);
 
-        // If we just emptied the best level on its side, walk the cursor inward.
+        // If the level is now empty, drop its occupancy bit and, if it was the
+        // best on its side, walk the cursor inward to the next occupied level.
         if self.pool.is_empty(&self.levels[idx as usize]) {
+            self.occupied.clear(idx as usize);
             match side {
-                Side::Bid if idx == self.best_bid => {
-                    self.best_bid = next_down(&self.levels, &self.pool, idx);
-                }
-                Side::Ask if idx == self.best_ask => {
-                    self.best_ask = next_up(&self.levels, &self.pool, idx);
-                }
+                Side::Bid if idx == self.best_bid => self.best_bid = self.next_down(idx),
+                Side::Ask if idx == self.best_ask => self.best_ask = self.next_up(idx),
                 _ => {}
             }
         }
         true
+    }
+
+    /// First occupied level strictly above `from`, as a cursor value.
+    #[inline]
+    fn next_up(&self, from: u32) -> u32 {
+        self.occupied
+            .next_set_from(from as usize + 1)
+            .map_or(NONE, |i| i as u32)
+    }
+
+    /// First occupied level strictly below `from`, as a cursor value.
+    #[inline]
+    fn next_down(&self, from: u32) -> u32 {
+        if from == 0 {
+            return NONE;
+        }
+        self.occupied
+            .prev_set_from(from as usize - 1)
+            .map_or(NONE, |i| i as u32)
     }
 
     /// The highest resting bid price, if any.
@@ -214,21 +232,6 @@ impl LadderBook {
             .get((price - self.min_price) as usize)
             .map_or(0, |lvl| lvl.total_qty)
     }
-}
-
-/// First non-empty level strictly above `from`, or [`NONE`].
-fn next_up(levels: &[Level], pool: &Pool, from: u32) -> u32 {
-    ((from as usize + 1)..levels.len())
-        .find(|&j| !pool.is_empty(&levels[j]))
-        .map_or(NONE, |j| j as u32)
-}
-
-/// First non-empty level strictly below `from`, or [`NONE`].
-fn next_down(levels: &[Level], pool: &Pool, from: u32) -> u32 {
-    (0..from as usize)
-        .rev()
-        .find(|&j| !pool.is_empty(&levels[j]))
-        .map_or(NONE, |j| j as u32)
 }
 
 #[cfg(test)]

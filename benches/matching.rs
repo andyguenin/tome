@@ -35,7 +35,7 @@ fn bench_submit(c: &mut Criterion) {
 
     // A tight band => lots of crossing (shallow book); a wide band => more
     // resting orders and a deeper book, where the BTreeMap's O(log n) bites.
-    for &band in &[10_u64, 1_000] {
+    for &band in &[10_u64, 1_000, 20_000] {
         const N: usize = 100_000;
         let flow = random_limit_flow(0xC10B, N, MID, band, 20);
         group.throughput(Throughput::Elements(N as u64));
