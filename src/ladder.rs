@@ -27,8 +27,9 @@
 use std::collections::HashMap;
 
 use crate::bitset::LevelBitset;
+use crate::engine::Engine;
 use crate::pool::{Level, Pool};
-use crate::types::{OrderId, Price, Qty, Side, SubmitResult, Trade};
+use crate::types::{L2Snapshot, Level2, OrderId, Price, Qty, Side, SubmitResult, Trade};
 
 /// Cursor sentinel meaning "no populated level on this side".
 const NONE: u32 = u32::MAX;
@@ -166,6 +167,77 @@ impl LadderBook {
         qty
     }
 
+    /// Submit a market order — match against the best prices with no limit.
+    /// Never rests; the unfilled remainder is reported in `resting`.
+    pub fn submit_market(&mut self, side: Side, qty: Qty) -> SubmitResult {
+        assert!(qty > 0, "cannot submit a zero-quantity order");
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let mut trades = Vec::new();
+        let buy = matches!(side, Side::Bid);
+        // No price limit: a buy accepts any ask, a sell accepts any bid.
+        let limit = if buy { Price::MAX } else { Price::MIN };
+        let remaining = self.take_liquidity(id, limit, qty, buy, &mut trades);
+
+        SubmitResult { id, trades, resting: remaining }
+    }
+
+    /// Change a resting order's quantity (see [`Engine::amend`]).
+    pub fn amend(&mut self, id: OrderId, new_qty: Qty) -> bool {
+        assert!(new_qty > 0, "amend to zero; use cancel instead");
+
+        let Some(&slot) = self.locations.get(&id) else {
+            return false;
+        };
+        let current = self.pool.qty_of(slot);
+        if new_qty == current {
+            return true;
+        }
+        let (price, side) = self.pool.location(slot);
+        let idx = self.index(price) as usize;
+
+        if new_qty < current {
+            // Shrink in place — time priority preserved.
+            self.pool.reduce(&mut self.levels[idx], slot, current - new_qty);
+        } else {
+            // Grow — priority is forfeited: move to the back of the level.
+            self.pool.unlink(&mut self.levels[idx], slot);
+            let new_slot = self.pool.push_back(&mut self.levels[idx], id, price, side, new_qty);
+            self.locations.insert(id, new_slot);
+            // The level stayed non-empty throughout, so its occupancy bit and
+            // the cursors are unchanged.
+        }
+        true
+    }
+
+    /// A snapshot of the top `depth` price levels per side, walking outward from
+    /// each cursor via the occupancy bitmap.
+    pub fn l2(&self, depth: usize) -> L2Snapshot {
+        let mut bids = Vec::new();
+        let mut i = self.best_bid;
+        while i != NONE && bids.len() < depth {
+            bids.push(Level2 {
+                price: self.min_price + i as Price,
+                qty: self.levels[i as usize].total_qty,
+            });
+            i = self.next_down(i);
+        }
+
+        let mut asks = Vec::new();
+        let mut j = self.best_ask;
+        while j != NONE && asks.len() < depth {
+            asks.push(Level2 {
+                price: self.min_price + j as Price,
+                qty: self.levels[j as usize].total_qty,
+            });
+            j = self.next_up(j);
+        }
+
+        L2Snapshot { bids, asks }
+    }
+
     /// Cancel a resting order by id (see [`crate::book::OrderBook::cancel`]).
     pub fn cancel(&mut self, id: OrderId) -> bool {
         let Some(slot) = self.locations.remove(&id) else {
@@ -231,6 +303,36 @@ impl LadderBook {
         self.levels
             .get((price - self.min_price) as usize)
             .map_or(0, |lvl| lvl.total_qty)
+    }
+}
+
+impl Engine for LadderBook {
+    fn submit_limit(&mut self, side: Side, price: Price, qty: Qty) -> SubmitResult {
+        LadderBook::submit_limit(self, side, price, qty)
+    }
+    fn submit_market(&mut self, side: Side, qty: Qty) -> SubmitResult {
+        LadderBook::submit_market(self, side, qty)
+    }
+    fn cancel(&mut self, id: OrderId) -> bool {
+        LadderBook::cancel(self, id)
+    }
+    fn amend(&mut self, id: OrderId, new_qty: Qty) -> bool {
+        LadderBook::amend(self, id, new_qty)
+    }
+    fn best_bid(&self) -> Option<Price> {
+        LadderBook::best_bid(self)
+    }
+    fn best_ask(&self) -> Option<Price> {
+        LadderBook::best_ask(self)
+    }
+    fn spread(&self) -> Option<Price> {
+        LadderBook::spread(self)
+    }
+    fn depth_at(&self, side: Side, price: Price) -> Qty {
+        LadderBook::depth_at(self, side, price)
+    }
+    fn l2(&self, depth: usize) -> L2Snapshot {
+        LadderBook::l2(self, depth)
     }
 }
 

@@ -17,8 +17,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use crate::engine::Engine;
 use crate::pool::{Level, Pool};
-use crate::types::{OrderId, Price, Qty, Side, SubmitResult, Trade};
+use crate::types::{L2Snapshot, Level2, OrderId, Price, Qty, Side, SubmitResult, Trade};
 
 /// A price-time-priority central limit order book.
 pub struct OrderBook {
@@ -90,6 +91,77 @@ impl OrderBook {
         SubmitResult { id, trades, resting: remaining }
     }
 
+    /// Submit a market order — match against the best prices with no limit.
+    /// Never rests; the unfilled remainder is reported in `resting`.
+    pub fn submit_market(&mut self, side: Side, qty: Qty) -> SubmitResult {
+        assert!(qty > 0, "cannot submit a zero-quantity order");
+
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let mut trades = Vec::new();
+        let remaining = match side {
+            Side::Bid => match_into(
+                &mut self.asks, &mut self.pool, &mut self.locations,
+                id, qty, &mut trades, Best::Lowest, |_| true,
+            ),
+            Side::Ask => match_into(
+                &mut self.bids, &mut self.pool, &mut self.locations,
+                id, qty, &mut trades, Best::Highest, |_| true,
+            ),
+        };
+
+        SubmitResult { id, trades, resting: remaining }
+    }
+
+    /// Change a resting order's quantity (see [`Engine::amend`]).
+    pub fn amend(&mut self, id: OrderId, new_qty: Qty) -> bool {
+        assert!(new_qty > 0, "amend to zero; use cancel instead");
+
+        let Some(&slot) = self.locations.get(&id) else {
+            return false;
+        };
+        let current = self.pool.qty_of(slot);
+        if new_qty == current {
+            return true;
+        }
+        let (price, side) = self.pool.location(slot);
+        let book = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+        };
+        let level = book.get_mut(&price).expect("resting order must have a level");
+
+        if new_qty < current {
+            // Shrink in place — time priority preserved.
+            self.pool.reduce(level, slot, current - new_qty);
+        } else {
+            // Grow — priority is forfeited: move to the back of the level.
+            self.pool.unlink(level, slot);
+            let new_slot = self.pool.push_back(level, id, price, side, new_qty);
+            self.locations.insert(id, new_slot);
+        }
+        true
+    }
+
+    /// A snapshot of the top `depth` price levels per side.
+    pub fn l2(&self, depth: usize) -> L2Snapshot {
+        let bids = self
+            .bids
+            .iter()
+            .rev()
+            .take(depth)
+            .map(|(&price, lvl)| Level2 { price, qty: lvl.total_qty })
+            .collect();
+        let asks = self
+            .asks
+            .iter()
+            .take(depth)
+            .map(|(&price, lvl)| Level2 { price, qty: lvl.total_qty })
+            .collect();
+        L2Snapshot { bids, asks }
+    }
+
     /// Cancel a resting order by id.
     ///
     /// Returns `true` if the order was resting and is now removed, `false` if
@@ -134,6 +206,36 @@ impl OrderBook {
             Side::Ask => &self.asks,
         };
         book.get(&price).map_or(0, |lvl| lvl.total_qty)
+    }
+}
+
+impl Engine for OrderBook {
+    fn submit_limit(&mut self, side: Side, price: Price, qty: Qty) -> SubmitResult {
+        OrderBook::submit_limit(self, side, price, qty)
+    }
+    fn submit_market(&mut self, side: Side, qty: Qty) -> SubmitResult {
+        OrderBook::submit_market(self, side, qty)
+    }
+    fn cancel(&mut self, id: OrderId) -> bool {
+        OrderBook::cancel(self, id)
+    }
+    fn amend(&mut self, id: OrderId, new_qty: Qty) -> bool {
+        OrderBook::amend(self, id, new_qty)
+    }
+    fn best_bid(&self) -> Option<Price> {
+        OrderBook::best_bid(self)
+    }
+    fn best_ask(&self) -> Option<Price> {
+        OrderBook::best_ask(self)
+    }
+    fn spread(&self) -> Option<Price> {
+        OrderBook::spread(self)
+    }
+    fn depth_at(&self, side: Side, price: Price) -> Qty {
+        OrderBook::depth_at(self, side, price)
+    }
+    fn l2(&self, depth: usize) -> L2Snapshot {
+        OrderBook::l2(self, depth)
     }
 }
 

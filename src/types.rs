@@ -57,6 +57,26 @@ pub struct SubmitResult {
     pub id: OrderId,
     /// Executions generated, in the order they occurred.
     pub trades: Vec<Trade>,
-    /// Quantity left resting on the book after matching (0 if fully filled).
+    /// For a limit order, quantity left resting on the book (0 if fully filled).
+    /// For a market order, quantity left *unfilled* — a market order never
+    /// rests, so any remainder after exhausting the book is simply cancelled.
     pub resting: Qty,
+}
+
+/// One aggregated price level in an L2 (market-by-price) snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Level2 {
+    /// The level's price, in ticks.
+    pub price: Price,
+    /// Total resting quantity across all orders at this price.
+    pub qty: Qty,
+}
+
+/// A depth-limited snapshot of the book: the top price levels per side.
+///
+/// `bids` run from best (highest) downward; `asks` from best (lowest) upward.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct L2Snapshot {
+    pub bids: Vec<Level2>,
+    pub asks: Vec<Level2>,
 }

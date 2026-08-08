@@ -5,14 +5,16 @@
 
 mod bitset;
 pub mod book;
+pub mod engine;
 pub mod ladder;
 mod pool;
 pub mod sim;
 pub mod types;
 
 pub use book::OrderBook;
+pub use engine::Engine;
 pub use ladder::LadderBook;
-pub use types::{OrderId, Price, Qty, Side, SubmitResult, Trade};
+pub use types::{L2Snapshot, Level2, OrderId, Price, Qty, Side, SubmitResult, Trade};
 
 #[cfg(test)]
 mod tests {
